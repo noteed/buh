@@ -1,0 +1,26 @@
+name:                buh
+version:             0.0.0
+Cabal-Version:       >= 1.8
+synopsis:            Bup routines.
+description:         Bup routines.
+category:            System
+license:             BSD3
+license-file:        LICENSE
+author:              Vo Minh Thu
+maintainer:          thu@hypered.io
+build-type:          Simple
+homepage:            https://github.com/noteed/buh
+
+source-repository head
+  type: git
+  location: git://github.com/noteed/buh.git
+
+executable buh
+  hs-source-dirs:      bin
+  main-is:             buh.hs
+  build-depends:       base == 4.*,
+                       bytestring == 0.9.*,
+                       process == 1.1.*,
+                       text == 0.11.*
+  ghc-options:         -Wall
+                       -O2
