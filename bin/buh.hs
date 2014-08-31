@@ -2,17 +2,26 @@
 {-# LANGUAGE PatternGuards #-}
 module Main (main) where
 
+import Codec.Compression.Zlib (compress)
 import Control.Applicative ((<$>))
 import Control.Monad (when)
 import qualified Data.Attoparsec.ByteString.Char8 as A
+import Data.Attoparsec.ByteString.Lazy (parse, Result(..))
+import Data.Binary.Put
+import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.ByteString.Lazy as L
+import qualified Data.ByteString.Lazy.Char8 as LC
+import Data.Digest.Pure.SHA (bytestringDigest, sha1)
+import Data.Int
 import Data.Thyme.Clock (UTCTime)
 import Data.Thyme.Format (formatTime)
 import Data.Thyme.Time () -- For instance Num POSIXTime (a.k.a. NominalDiffTime)
 import Data.Thyme.Time.Core (posixSecondsToUTCTime)
+import Data.Word
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..))
 import System.FilePath (splitDirectories)
@@ -22,6 +31,10 @@ import System.Process
   ( createProcess, proc, readProcessWithExitCode, waitForProcess
   , CreateProcess(..), StdStream(..)
   )
+
+----------------------------------------------------------------------
+-- Command-line
+----------------------------------------------------------------------
 
 main :: IO ()
 main = do
@@ -65,17 +78,22 @@ main = do
           Commit tree <- readCommit $ Ref sha
           enter cat name rest tree
         _ -> error "TODO"
+    ["pack"] -> do
+      o <- readBlob $ Ref "32ab47487f560b11fdc758eedd9b43ee7aeb8684"
+      writePack "/tmp/t.pack" [o]
     _ -> return ()
 
+ls :: String -> Object -> IO ()
 ls p o = case o of
   Commit _ -> error "resolve to a commit"
   Tree es -> mapM_ (BC.putStrLn . fst) $ treeToRefs es
   Blob _ _ _ -> putStrLn p
 
-cat p o = case o of
+cat :: String -> Object -> IO ()
+cat _ o = case o of
   Commit _ -> error "resolve to a commit"
   Tree es -> error "is a directory"
-  Blob _ _ bs -> BC.putStr bs
+  Blob _ _ bs -> L.putStr bs
 
 enter f p ps ref = do
   o <- readObject ref
@@ -93,6 +111,10 @@ lookupPath k es = do
     Just v -> return v
     _ -> error $ "no file '" ++ BC.unpack k ++ "'" -- TODO exitFailure
 
+----------------------------------------------------------------------
+-- Read git objects and refs
+----------------------------------------------------------------------
+
 -- | Convert a Tree to the type returned by readHeads.
 treeToRefs = map (\(_, b, c) -> (b, c))
 
@@ -103,7 +125,7 @@ newtype Ref = Ref { unRef ::ByteString } -- TODO Can it actually be non-ascii ?
   deriving Show
 
 data Object =
-    Blob Ref Int ByteString
+    Blob Ref Int64 L.ByteString
   | Tree [(ByteString, ByteString, Ref)] -- ^ Mode, name, sha
   | Commit Ref -- ^ Tree ref.
   deriving Show
@@ -142,24 +164,26 @@ readObjects refs = do
       readOne = do
         ws <- BC.words <$> BC.hGetLine pOut
         case ws of
-          [sha, typ, size_] | Just (size, _) <- BC.readInt size_ -> do
-            o <- B.hGet pOut size
+          [sha, typ, size_] | Just (size, _) <- BC.readInteger size_ -> do
+            -- TODO hGet takes an Int, maybe we should read again if the Int64
+            -- is really useful.
+            o <- L.hGet pOut (fromInteger size)
             nl <- BC.hGetLine pOut
             when (nl /= "") $ error "unexpected git-cat-file output (1)"
             case typ of
-              "blob" -> return $ Blob (Ref sha) size o
+              "blob" -> return $ Blob (Ref sha) (fromInteger size) o
               "tree" -> do
                 let loop xs s = do
-                      if BC.null s
+                      if L.null s
                         then return . Tree $ reverse xs
                         else do
                           -- Maybe rewrite this with attoparsec.
-                          let (a, b) = BC.span (/= ' ') s
-                              c = BC.drop 1 b
-                              (d, d') = BC.span (/= '\0') c
-                              e = BC.drop 1 d'
-                              (f, g) = BC.splitAt 20 e
-                          loop ((a,d, Ref $ B16.encode f): xs) g
+                          let (a, b) = LC.span (/= ' ') s
+                              c = LC.drop 1 b
+                              (d, d') = LC.span (/= '\0') c
+                              e = LC.drop 1 d'
+                              (f, g) = LC.splitAt 20 e
+                          loop ((toStrict a,toStrict d, Ref . B16.encode $ toStrict f): xs) g
                 loop [] o
               "commit" -> return $ parseCommit o
               _ -> error "unexpected git-cat-file output (2)"
@@ -168,6 +192,8 @@ readObjects refs = do
   hClose pIn
   _ <- waitForProcess p
   return os
+
+toStrict = B.concat . L.toChunks
 
 -- | Similar to `readObjects` with a single ref.
 readObject :: Ref -> IO Object
@@ -178,12 +204,21 @@ readObject ref = do
     _ -> error $ "can't happen"
 
 -- | Similar to `readObjects` (with a single ref), and error out if the result
+-- is not a blob.
+readBlob :: Ref -> IO Object
+readBlob ref = do
+  o <- readObject ref
+  case o of
+    Blob _ _ _ -> return o
+    _ -> error $ "expected blob object"
+
+-- | Similar to `readObjects` (with a single ref), and error out if the result
 -- is not a commit.
 readCommit :: Ref -> IO Object
 readCommit ref = do
   o <- readObject ref
   case o of
-    Commit tree -> return $ Commit tree
+    Commit _ -> return o
     _ -> error $ "expected commit object"
 
 -- | Similar to `readObjects` (with a single ref), and error out if the result
@@ -192,13 +227,13 @@ readTree :: Ref -> IO Object
 readTree ref = do
   o <- readObject ref
   case o of
-    Tree es -> return $ Tree es
+    Tree _ -> return o
     _ -> error $ "expected tree object"
 
-parseCommit :: ByteString -> Object
-parseCommit bs = case A.parseOnly p bs of
-  Left err -> error err
-  Right r -> r
+parseCommit :: L.ByteString -> Object
+parseCommit bs = case parse p bs of
+  Fail _ _ err -> error err
+  Done _ r -> r
   where
   p = do
     _ <- A.string "tree "
@@ -240,3 +275,51 @@ readRevs ref = do
   format = "%Y-%m-%d-%H%M%S"
   latest (x@(_, r) : xs) = ("latest", r) : x : xs
   latest _ = []
+
+----------------------------------------------------------------------
+-- Write packfile
+----------------------------------------------------------------------
+
+writePack :: FilePath -> [Object] -> IO ()
+writePack fn os = L.writeFile fn p
+  -- TODO Compute the SHA1 sum on-the-fly.
+  where p_ = runPut $ buildPack os
+        sha = bytestringDigest $ sha1 p_
+        p = p_ `L.append` sha
+
+buildPack :: [Object] -> Put
+buildPack os = do
+  putByteString "PACK\0\0\0\2"
+  putWord32be . fromIntegral $ length os
+  mapM_ packObject os
+
+packObject :: Object -> Put
+packObject o = do
+  case o of
+    Blob _ size bs -> do
+      encodeLength o size -- Assume that L.length bs == size.
+      putLazyByteString $ compress bs
+    -- TODO
+
+-- | Variable length unsigned integer encoding.
+encodeLength :: Object -> Int64 -> Put
+encodeLength o n = loop size b
+  where
+  --  Object type is in the three last bits of the first nibble
+  --  The first bit (not yet set) is the "continue" bit.
+  --   /                             / The second nibble contains the size.
+  b = (shiftL (objectType o) 4) .|. (fromIntegral n .&. 0x0f)
+  size = shiftR n 4
+  loop sz c =
+    if sz /= 0
+    then do
+      putWord8 $ c .|. 0x80 -- set the "continue"
+      loop (shiftR sz 7) (fromIntegral sz .&. 0x7f) -- and continue with the next 7 bits
+    else putWord8 c
+
+objectType :: Object -> Word8
+objectType o = case o of
+  Commit _ -> 1
+  Tree _ -> 2
+  Blob _ _ _ -> 3
+  -- Tag -> 4
