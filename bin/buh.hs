@@ -65,7 +65,7 @@ main = do
           Sha sha <- lookupPath (BC.pack hd) hds
           cs <- readRevs (Ref sha)
           Ref sha <- lookupPath (BC.pack name) cs
-          Commit tree <- readCommit $ Ref sha
+          Commit (Just tree) _ _ <- readCommit $ Ref sha
           enter ls name rest tree
         _ -> error "TODO"
     ["cat-file", path] -> do
@@ -75,23 +75,30 @@ main = do
           Sha sha <- lookupPath (BC.pack hd) hds
           cs <- readRevs (Ref sha)
           Ref sha <- lookupPath (BC.pack name) cs
-          Commit tree <- readCommit $ Ref sha
+          Commit (Just tree) _ _ <- readCommit $ Ref sha
           enter cat name rest tree
         _ -> error "TODO"
     ["pack"] -> do
-      o <- readBlob $ Ref "32ab47487f560b11fdc758eedd9b43ee7aeb8684"
-      writePack "/tmp/t.pack" [o]
+      let sha = Ref "32ab47487f560b11fdc758eedd9b43ee7aeb8684"
+      o <- readBlob sha
+      let t = Tree [(normalFile, "buh.cabal", sha)]
+      writePack "/tmp/t.pack" [o, t]
+      writePack' "/tmp/t.pack" 3 $ do
+        putObject o
+        sha <- putObject t
+        putObject $ Commit (Just sha) Nothing ""
+        return ()
     _ -> return ()
 
 ls :: String -> Object -> IO ()
 ls p o = case o of
-  Commit _ -> error "resolve to a commit"
+  Commit _ _ _ -> error "resolve to a commit"
   Tree es -> mapM_ (BC.putStrLn . fst) $ treeToRefs es
   Blob _ _ _ -> putStrLn p
 
 cat :: String -> Object -> IO ()
 cat _ o = case o of
-  Commit _ -> error "resolve to a commit"
+  Commit _ _ _ -> error "resolve to a commit"
   Tree es -> error "is a directory"
   Blob _ _ bs -> L.putStr bs
 
@@ -103,7 +110,7 @@ enter f p ps ref = do
       Tree es -> do
         ref <- lookupPath (BC.pack p') $ treeToRefs es
         enter f p' ps' ref
-      Commit _ -> error "Deref the tree ?"
+      Commit _ _ _ -> error "Deref the tree ?"
     [] -> f p o
 
 lookupPath k es = do
@@ -127,7 +134,7 @@ newtype Ref = Ref { unRef ::ByteString } -- TODO Can it actually be non-ascii ?
 data Object =
     Blob Ref Int64 L.ByteString
   | Tree [(ByteString, ByteString, Ref)] -- ^ Mode, name, sha
-  | Commit Ref -- ^ Tree ref.
+  | Commit (Maybe Ref) (Maybe Ref) ByteString -- ^ Tree ref, parent ref, message.
   deriving Show
 
 -- | `git show-ref`
@@ -193,6 +200,7 @@ readObjects refs = do
   _ <- waitForProcess p
   return os
 
+toStrict :: L.ByteString -> ByteString
 toStrict = B.concat . L.toChunks
 
 -- | Similar to `readObjects` with a single ref.
@@ -218,7 +226,7 @@ readCommit :: Ref -> IO Object
 readCommit ref = do
   o <- readObject ref
   case o of
-    Commit _ -> return o
+    Commit _ _ _ -> return o
     _ -> error $ "expected commit object"
 
 -- | Similar to `readObjects` (with a single ref), and error out if the result
@@ -236,14 +244,14 @@ parseCommit bs = case parse p bs of
   Done _ r -> r
   where
   p = do
-    _ <- A.string "tree "
+    _ <- A.string "tree " -- TODO Optional.
     treeSha <- A.takeWhile isSha
     when (B.length treeSha /= 40) $ error "unexpected tree ref length"
     _ <- A.char '\n'
     -- TODO
     _ <- A.takeByteString
     A.endOfInput
-    return $ Commit (Ref treeSha)
+    return $ Commit (Just $ Ref treeSha) Nothing ""
 
   isSha c = (c >= '0' && c <= '9') ||
             (c >= 'a' && c <= 'f') ||
@@ -278,37 +286,115 @@ readRevs ref = do
 
 ----------------------------------------------------------------------
 -- Write packfile
+--
+-- A packfile can be verified with `git verify-pack`. It needs a corresponding
+-- `.idx` file which be can generated with `git index-pack`. E.g.:
+--
+--     > git index-pack t.pack
+--     > git verify-pack -v t.pack
+--     32ab47487f560b11fdc758eedd9b43ee7aeb8684 blob   749 349 12
+--     non delta: 1 object
+--     t.pack: ok
+--
+-- Those two commands don't need a a Git repository to work. On the other
+-- hand, to use a command such as `git cat-file`, a real Git repository must
+-- be provided:
+--
+--     > git init --bare repo
+--     > cp t.{idx,pack} repo
+--     > cd repo
+--     > echo 32ab47487f560b11fdc758eedd9b43ee7aeb8684 | git cat-file --batch
+--     32ab47487f560b11fdc758eedd9b43ee7aeb8684 blob 749
+--     ... blob content ...
+--
+-- If the packfile contain a commit, we can pretend HEAD points to it, inspect
+-- it, or even do a checkout:
+--
+--     > echo 709149cd69d4e13c8740e5bb3d832f97fcb08878 > refs/heads/master
+--     > git log
+--     commit 709149cd69d4e13c8740e5bb3d832f97fcb08878 
+--
+--     > mkdir ../work
+--     > GIT_WORK_TREE=../work git checkout master
+--     Already on 'master'
+--
 ----------------------------------------------------------------------
 
+-- | Write a packfile made of the given objects.
 writePack :: FilePath -> [Object] -> IO ()
-writePack fn os = L.writeFile fn p
+writePack fn os = writePack' fn n $ mapM_ putObject os
+  where n = length os
+
+-- | Write a packfile. The content of the packfile is provided as a
+-- `Data.Binary.Put` serializer. The number of objects must be provided
+-- explicitely.
+writePack' :: FilePath -> Int -> Put -> IO ()
+writePack' fn n os = L.writeFile fn p
   -- TODO Compute the SHA1 sum on-the-fly.
-  where p_ = runPut $ buildPack os
+  where p_ = runPut $ buildPack n os
         sha = bytestringDigest $ sha1 p_
         p = p_ `L.append` sha
 
-buildPack :: [Object] -> Put
-buildPack os = do
+-- | Build a packfile, minus its SHA1 sum.
+buildPack :: Int -> Put -> Put
+buildPack n os = do
   putByteString "PACK\0\0\0\2"
-  putWord32be . fromIntegral $ length os
-  mapM_ packObject os
+  putWord32be . fromIntegral $ n
+  os
 
-packObject :: Object -> Put
-packObject o = do
-  case o of
-    Blob _ size bs -> do
-      encodeLength o size -- Assume that L.length bs == size.
-      putLazyByteString $ compress bs
-    -- TODO
+-- | Serialize an object, using the packfile format.
+putObject :: Object -> PutM Ref
+putObject o = case o of
+  Blob _ size bs -> do
+    putLength 3 size -- Assume that L.length bs == size.
+    putLazyByteString $ compress bs
+    return $ computeSha o
+  Tree es -> do
+    let bs = runPut $ putTree es
+    putLength 2 $ L.length bs
+    putLazyByteString $ compress bs
+    return $ computeSha o
+  Commit mtree mparent msg -> do
+    let bs = runPut $ putCommit mtree mparent Nothing Nothing msg
+    putLength 1 $ L.length bs
+    putLazyByteString $ compress bs
+    return $ computeSha o
 
--- | Variable length unsigned integer encoding.
-encodeLength :: Object -> Int64 -> Put
-encodeLength o n = loop size b
+-- | Each object stored in a packfile still retain its loose object SHA1 sum.
+computeSha :: Object -> Ref
+computeSha o =
+    Ref . B16.encode . toStrict . bytestringDigest . sha1 . runPut $ putLoose o
+
+-- | Serialize an object using the loose format (but not yet zlib compressed).
+putLoose :: Object -> Put
+putLoose o = case o of
+  Blob _ size bs -> do
+    putByteString "blob "
+    putByteString (BC.pack $ show size)
+    putWord8 0
+    putLazyByteString bs
+  Tree es -> do
+    let bs = runPut $ putTree es
+    putByteString "tree "
+    putByteString (BC.pack $ show $ L.length bs)
+    putWord8 0
+    putLazyByteString bs
+  Commit mtree mparent msg -> do
+    let bs = runPut $ putCommit mtree mparent Nothing Nothing msg
+    putByteString "commit "
+    putByteString (BC.pack $ show $ L.length bs)
+    putWord8 0
+    putLazyByteString bs
+
+-- | Variable length unsigned integer encoding, used in the packfile format.
+-- The type of the object is included.
+putLength :: Word8 -> Int64 -> Put
+putLength t n = loop size b
   where
   --  Object type is in the three last bits of the first nibble
   --  The first bit (not yet set) is the "continue" bit.
   --   /                             / The second nibble contains the size.
-  b = (shiftL (objectType o) 4) .|. (fromIntegral n .&. 0x0f)
+  b = (shiftL t 4) .|. (fromIntegral n .&. 0x0f)
   size = shiftR n 4
   loop sz c =
     if sz /= 0
@@ -317,9 +403,34 @@ encodeLength o n = loop size b
       loop (shiftR sz 7) (fromIntegral sz .&. 0x7f) -- and continue with the next 7 bits
     else putWord8 c
 
-objectType :: Object -> Word8
-objectType o = case o of
-  Commit _ -> 1
-  Tree _ -> 2
-  Blob _ _ _ -> 3
-  -- Tag -> 4
+-- | Write triple (Mode, name, sha) as a `tree` object in the packfile format.
+putTree :: [(ByteString, ByteString, Ref)] -> Put
+putTree es = mapM_ putEntry es'
+  where
+  es' = es -- TODO sortBy f es
+  putEntry (mode, name, Ref sha) = do
+    putByteString mode
+    putWord8 32 -- that is ' '
+    putByteString name
+    putWord8 0
+    case B16.decode sha of
+      (sha', rest) | B.null rest -> putByteString sha'
+      _ -> error "putEntry: invalid sha"
+
+putCommit :: Maybe Ref -> Maybe Ref -> Maybe (ByteString, UTCTime)
+  -> Maybe (ByteString, UTCTime) -> ByteString -> Put
+putCommit mtree mparent mauthor mcommitter msg = do
+  let opt s f m = do
+        maybe (return ()) (\v -> do
+          putByteString s
+          putByteString $ f v
+          putWord8 10 -- that is '\n'
+          ) m
+  opt "tree " unRef mtree
+  opt "parent " unRef mparent
+  -- TODO
+  putWord8 10
+  putByteString msg
+
+normalFile :: ByteString
+normalFile = "100644"
