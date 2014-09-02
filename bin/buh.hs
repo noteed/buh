@@ -19,11 +19,13 @@ import qualified Data.ByteString.Lazy.Internal as I
 import Data.Digest.Pure.SHA (bytestringDigest, sha1)
 import Data.Int
 import Data.IORef
+import Data.List (sortBy)
 import Data.Thyme.Clock (UTCTime)
 import Data.Thyme.Format (formatTime)
 import Data.Thyme.Time () -- For instance Num POSIXTime (a.k.a. NominalDiffTime)
 import Data.Thyme.Time.Core (posixSecondsToUTCTime)
 import Data.Word
+import System.Directory (doesDirectoryExist)
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..))
 import System.FilePath (splitDirectories)
@@ -46,6 +48,16 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
+    ["init", path] -> do
+      e <- doesDirectoryExist path
+      if e
+        then error $ "directory " ++ path ++ " already exist"
+        else do
+          (_, _, _, p) <- createProcess (proc "git"
+            [ "init", "--bare", path
+            ])
+          _ <- waitForProcess p
+          return ()
     ["test"] -> do
       readRefs Nothing >>= print
       readHeads Nothing >>= print
@@ -73,23 +85,33 @@ main = do
       case splitDirectories path of
         rest -> enterMasterLatest cat rest
     ["pack"] -> do
-      let sha = Ref "32ab47487f560b11fdc758eedd9b43ee7aeb8684"
-      o <- readBlob sha
-      let t = Tree [(normalFile, "buh.cabal", sha)]
-
-      -- Two different ways to write a packfile, either by passing a Put...
-      writePack "/tmp/t.pack" 3 $ do
-        _ <- putObject o
-        sha' <- putObject t
-        _ <- putObject $ Commit (Just sha') Nothing ""
-        return ()
-
-      -- ... or by using a Packer.
-      packer <- newPack "/tmp/p2.pack"
-      pack_ packer o
-      sha' <- pack packer t
-      pack_ packer $ Commit (Just sha') Nothing ""
+      packer <- newPack "objects/pack/p1.pack"
+      sha <- pack packer $ Blob 15 "Nice isn't it?\n"
+      sha' <- pack packer $ Tree [(normalFile, "README.md", sha)]
+      Ref sha'' <- pack packer $ Commit (Just sha') Nothing ""
       completePack packer
+      (_, _, _, p) <- createProcess (proc "git"
+        [ "index-pack", "-v", "objects/pack/p1.pack"
+        ])
+      _ <- waitForProcess p
+      B.writeFile "refs/heads/master" $ sha'' `BC.append` "\n"
+
+      hds <- readHeads Nothing
+      Sha sha <- lookupPath "master" hds
+      cs <- readRevs (Ref sha)
+      Ref sha' <- lookupPath "latest" cs
+      Commit (Just tree) _ _ <- readCommit $ Ref sha'
+
+      packer <- newPack "objects/pack/p2.pack"
+      sha <- rewrite packer [] (["new.txt"], Blob 6 "hello\n") tree
+      Ref sha'' <- pack packer $ Commit (Just sha) (Just $ Ref sha'') "Added new.txt."
+      completePack packer
+      (_, _, _, p) <- createProcess (proc "git"
+        [ "index-pack", "-v", "objects/pack/p2.pack"
+        ])
+      _ <- waitForProcess p
+      B.writeFile "refs/heads/new-branch" $ sha'' `BC.append` "\n"
+      return ()
 
     xs -> error $ "TODO " ++ show xs
 
@@ -106,20 +128,20 @@ ls :: String -> Object -> IO ()
 ls p o = case o of
   Commit _ _ _ -> error "resolve to a commit"
   Tree es -> mapM_ (BC.putStrLn . fst) $ treeToRefs es
-  Blob _ _ _ -> putStrLn p
+  Blob _ _ -> putStrLn p
 
 cat :: String -> Object -> IO ()
 cat _ o = case o of
   Commit _ _ _ -> error "resolve to a commit"
   Tree _ -> error "is a directory"
-  Blob _ _ bs -> L.putStr bs
+  Blob _ bs -> L.putStr bs
 
 enter :: (String -> Object -> IO a) -> String -> [String] -> Ref -> IO a
 enter f p ps ref = do
   o <- readObject ref
   case ps of
     p':ps' -> case o of
-      Blob _ _ _ -> error $ "no file '" ++ p' ++ "'"
+      Blob _ _ -> error $ "no file '" ++ p' ++ "'"
       Tree es -> do
         ref' <- lookupPath (BC.pack p') $ treeToRefs es
         enter f p' ps' ref'
@@ -131,6 +153,25 @@ lookupPath k es = do
   case lookup k es of
     Just v -> return v
     _ -> error $ "no file '" ++ BC.unpack k ++ "'" -- TODO exitFailure
+
+-- TODO Handle only the most simple case.
+rewrite packer ps ([name], blob) ref = do
+  o <- readObject ref
+  case ps of
+    p':ps' -> case o of
+      Blob _ _ -> error $ "todo"
+      Tree es -> undefined
+      Commit _ _ _ -> error "todo"
+    [] -> case o of
+      Blob _ _ -> error $ "todo"
+      Tree es -> do
+        sha <- pack packer blob
+        let e = (normalFile, name, sha)
+        pack packer $ Tree $ e : remove name es
+      Commit _ _ _ -> error "Deref the tree ?"
+
+remove p = filter ((/= p) . fst')
+  where fst' (a, _, _) = a
 
 ----------------------------------------------------------------------
 -- Read git objects and refs
@@ -147,7 +188,7 @@ newtype Ref = Ref { unRef ::ByteString } -- TODO Can it actually be non-ascii ?
   deriving Show
 
 data Object =
-    Blob Ref Int64 L.ByteString
+    Blob Int64 L.ByteString
   | Tree [(ByteString, ByteString, Ref)] -- ^ Mode, name, sha
   | Commit (Maybe Ref) (Maybe Ref) ByteString -- ^ Tree ref, parent ref, message.
   deriving Show
@@ -193,7 +234,7 @@ readObjects refs = do
             nl <- BC.hGetLine pOut
             when (nl /= "") $ error "unexpected git-cat-file output (1)"
             case typ of
-              "blob" -> return $ Blob (Ref sha) (fromInteger size) o
+              "blob" -> return $ Blob (fromInteger size) o
               "tree" -> do
                 let loop xs s = do
                       if L.null s
@@ -232,7 +273,7 @@ readBlob :: Ref -> IO Object
 readBlob ref = do
   o <- readObject ref
   case o of
-    Blob _ _ _ -> return o
+    Blob _ _ -> return o
     _ -> error $ "expected blob object"
 
 -- | Similar to `readObjects` (with a single ref), and error out if the result
@@ -283,7 +324,12 @@ revList ref = do
     else error "git failed"
   where
   -- TODO read
-  p xs (l1:l2:rest) = p ((Ref . BC.pack $ drop 7 l1, posixSecondsToUTCTime . fromInteger $ read l2) : xs) rest
+  p xs (l1:l2:rest) | "commit":_ <- words l2 =
+    p ((Ref . BC.pack $ drop 7 l1, posixSecondsToUTCTime . fromInteger $ 0) : xs) (l2:rest)
+  p xs (l1:l2:rest) =
+    p ((Ref . BC.pack $ drop 7 l1, posixSecondsToUTCTime . fromInteger $ read l2) : xs) rest
+  p xs [l1] | "commit":_ <- words l1 =
+    p ((Ref . BC.pack $ drop 7 l1, posixSecondsToUTCTime . fromInteger $ 0) : xs) []
   p xs [] = xs
   p _ _ = error "unexpected line from git-rev-list"
 
@@ -409,7 +455,7 @@ buildPack n os = do
 -- | Serialize an object, using the packfile format.
 putObject :: Object -> PutM Ref
 putObject o = case o of
-  Blob _ size bs -> do
+  Blob size bs -> do
     putLength 3 size -- Assume that L.length bs == size.
     putLazyByteString $ compress bs
     return $ computeSha o
@@ -432,7 +478,7 @@ computeSha o =
 -- | Serialize an object using the loose format (but not yet zlib compressed).
 putLoose :: Object -> Put
 putLoose o = case o of
-  Blob _ size bs -> do
+  Blob size bs -> do
     putByteString "blob "
     putByteString (BC.pack $ show size)
     putWord8 0
@@ -471,7 +517,9 @@ putLength t n = loop size b
 putTree :: [(ByteString, ByteString, Ref)] -> Put
 putTree es = mapM_ putEntry es'
   where
-  es' = es -- TODO sortBy f es
+  es' = sortBy filenames es
+  filenames (mode1, n1, _) (mode2, n2, _) = compare (f mode1 n1) (f mode2 n2)
+    where f mode n = if mode == subdirectory then n `B.append` "/" else n
   putEntry (mode, name, Ref sha) = do
     putByteString mode
     putWord8 32 -- that is ' '
@@ -498,3 +546,6 @@ putCommit mtree mparent mauthor mcommitter msg = do
 
 normalFile :: ByteString
 normalFile = "100644"
+
+subdirectory :: ByteString
+subdirectory = "040000"

@@ -1,27 +1,28 @@
 #! /bin/bash
 
-# Somehow validate the pack creation. It tries to create an index, extract
-# the objects using `git cat-file`, and checkout the tree.
+# Somehow validate the pack creation. It tries to extract the objects using
+# `git cat-file`, and checkout the tree.
 
-./dist/build/buh/buh pack
-git index-pack /tmp/t.pack
-git verify-pack -v /tmp/t.pack
-
-git init --bare /tmp/repo
-cp /tmp/t.{idx,pack} /tmp/repo/objects/pack/
+./dist/build/buh/buh init /tmp/repo
 cd /tmp/repo
+$HOME/projects/buh/dist/build/buh/buh pack
+
+git verify-pack -v objects/pack/p1.pack
+git verify-pack -v objects/pack/p2.pack
 
 git cat-file --batch-check << EOF
-32ab47487f560b11fdc758eedd9b43ee7aeb8684
-85368e63a1ef657360e107818b529727b73b001e
-709149cd69d4e13c8740e5bb3d832f97fcb08878
+51c9ddc4a58cca9a62002120d25480201e7b8cc8
+09f8177e9ea464d8a06f880ebd5575ae42f52cda
+e6b9d54befa4e9c72ce8463c54b1e78737df3eba
 EOF
 
-echo 709149cd69d4e13c8740e5bb3d832f97fcb08878 > refs/heads/master
 git log
+git log -p new-branch
 
 mkdir work
 GIT_WORK_TREE=work git checkout master
+ls work
+GIT_WORK_TREE=work git checkout new-branch
 ls work
 
 cd -
