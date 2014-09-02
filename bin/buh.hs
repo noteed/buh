@@ -15,8 +15,10 @@ import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Lazy.Char8 as LC
+import qualified Data.ByteString.Lazy.Internal as I
 import Data.Digest.Pure.SHA (bytestringDigest, sha1)
 import Data.Int
+import Data.IORef
 import Data.Thyme.Clock (UTCTime)
 import Data.Thyme.Format (formatTime)
 import Data.Thyme.Time () -- For instance Num POSIXTime (a.k.a. NominalDiffTime)
@@ -25,7 +27,11 @@ import Data.Word
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..))
 import System.FilePath (splitDirectories)
-import System.IO (hClose, hFlush)
+import System.IO
+  ( hClose, hFlush, hSeek, hSetFileSize, openFile, Handle, IOMode(..)
+  , SeekMode(AbsoluteSeek)
+  )
+import System.IO.Unsafe (unsafeInterleaveIO)
 import System.Locale (defaultTimeLocale)
 import System.Process
   ( createProcess, proc, readProcessWithExitCode, waitForProcess
@@ -50,45 +56,51 @@ main = do
         ] >>= print
       revList (Ref "a5b6d23259c76b66c933ba9940f6afcdf1bf3fff") >>= print
       readRevs (Ref "a5b6d23259c76b66c933ba9940f6afcdf1bf3fff") >>= print
-    ["ls"] -> do
-      hds <- readHeads Nothing
-      mapM_ (BC.putStrLn . fst) hds
+    ["ls"] -> enterMasterLatest ls []
+    ["ls", "/"] -> do
+      putStrLn "blob" -- access logical blobs, not chunks
+      putStrLn "branch"
+      putStrLn "chunk" -- access all blobs
+      putStrLn "commit"
+      putStrLn "time" -- same as commit but using the bup format YY-MM-DD-hhmmss instead of a hash
     ["ls", path] -> do
       case splitDirectories path of
-        [hd] -> do
+        ["/", "branch"] -> do
           hds <- readHeads Nothing
-          Sha sha <- lookupPath (BC.pack hd) hds
-          cs <- readRevs (Ref sha)
-          mapM_ (BC.putStrLn . fst) cs
-        hd : name : rest -> do
-          hds <- readHeads Nothing
-          Sha sha <- lookupPath (BC.pack hd) hds
-          cs <- readRevs (Ref sha)
-          Ref sha <- lookupPath (BC.pack name) cs
-          Commit (Just tree) _ _ <- readCommit $ Ref sha
-          enter ls name rest tree
-        _ -> error "TODO"
-    ["cat-file", path] -> do
+          mapM_ (BC.putStrLn . fst) hds
+        rest -> enterMasterLatest ls rest
+    ["cat", path] -> do
       case splitDirectories path of
-        hd : name : rest -> do
-          hds <- readHeads Nothing
-          Sha sha <- lookupPath (BC.pack hd) hds
-          cs <- readRevs (Ref sha)
-          Ref sha <- lookupPath (BC.pack name) cs
-          Commit (Just tree) _ _ <- readCommit $ Ref sha
-          enter cat name rest tree
-        _ -> error "TODO"
+        rest -> enterMasterLatest cat rest
     ["pack"] -> do
       let sha = Ref "32ab47487f560b11fdc758eedd9b43ee7aeb8684"
       o <- readBlob sha
       let t = Tree [(normalFile, "buh.cabal", sha)]
-      writePack "/tmp/t.pack" [o, t]
-      writePack' "/tmp/t.pack" 3 $ do
-        putObject o
-        sha <- putObject t
-        putObject $ Commit (Just sha) Nothing ""
+
+      -- Two different ways to write a packfile, either by passing a Put...
+      writePack "/tmp/t.pack" 3 $ do
+        _ <- putObject o
+        sha' <- putObject t
+        _ <- putObject $ Commit (Just sha') Nothing ""
         return ()
-    _ -> return ()
+
+      -- ... or by using a Packer.
+      packer <- newPack "/tmp/p2.pack"
+      pack_ packer o
+      sha' <- pack packer t
+      pack_ packer $ Commit (Just sha') Nothing ""
+      completePack packer
+
+    xs -> error $ "TODO " ++ show xs
+
+enterMasterLatest :: (String -> Object -> IO a) -> [String] -> IO a
+enterMasterLatest f path = do
+  hds <- readHeads Nothing
+  Sha sha <- lookupPath "master" hds
+  cs <- readRevs (Ref sha)
+  Ref sha' <- lookupPath "latest" cs
+  Commit (Just tree) _ _ <- readCommit $ Ref sha'
+  enter f "latest" path tree
 
 ls :: String -> Object -> IO ()
 ls p o = case o of
@@ -99,20 +111,22 @@ ls p o = case o of
 cat :: String -> Object -> IO ()
 cat _ o = case o of
   Commit _ _ _ -> error "resolve to a commit"
-  Tree es -> error "is a directory"
+  Tree _ -> error "is a directory"
   Blob _ _ bs -> L.putStr bs
 
+enter :: (String -> Object -> IO a) -> String -> [String] -> Ref -> IO a
 enter f p ps ref = do
   o <- readObject ref
   case ps of
     p':ps' -> case o of
       Blob _ _ _ -> error $ "no file '" ++ p' ++ "'"
       Tree es -> do
-        ref <- lookupPath (BC.pack p') $ treeToRefs es
-        enter f p' ps' ref
+        ref' <- lookupPath (BC.pack p') $ treeToRefs es
+        enter f p' ps' ref'
       Commit _ _ _ -> error "Deref the tree ?"
     [] -> f p o
 
+lookupPath :: ByteString -> [(ByteString, a)] -> IO a
 lookupPath k es = do
   case lookup k es of
     Just v -> return v
@@ -123,6 +137,7 @@ lookupPath k es = do
 ----------------------------------------------------------------------
 
 -- | Convert a Tree to the type returned by readHeads.
+treeToRefs :: [(ByteString, ByteString, Ref)] -> [(ByteString, Ref)]
 treeToRefs = map (\(_, b, c) -> (b, c))
 
 newtype Sha = Sha ByteString
@@ -301,7 +316,7 @@ readRevs ref = do
 -- be provided:
 --
 --     > git init --bare repo
---     > cp t.{idx,pack} repo
+--     > cp t.{idx,pack} repo/objects/pack/
 --     > cd repo
 --     > echo 32ab47487f560b11fdc758eedd9b43ee7aeb8684 | git cat-file --batch
 --     32ab47487f560b11fdc758eedd9b43ee7aeb8684 blob 749
@@ -320,16 +335,65 @@ readRevs ref = do
 --
 ----------------------------------------------------------------------
 
--- | Write a packfile made of the given objects.
-writePack :: FilePath -> [Object] -> IO ()
-writePack fn os = writePack' fn n $ mapM_ putObject os
-  where n = length os
+-- | Incrementally build a pack.
+newPack :: FilePath -> IO Packer
+newPack fn = do
+  h <- openFile fn ReadWriteMode
+  hSetFileSize h 0 -- TODO Instead use a temporary (and thus new) file,
+                   -- moving it to the correct path when it is complete.
+  -- The number of objects will be set in `completePack`.
+  BC.hPut h "PACK\0\0\0\2\0\0\0\0"
+  counter <- newIORef 0
+  return Packer
+    { packerPack = \o -> do
+        modifyIORef counter succ
+        let (sha, bs) = runPutM $ putObject o
+        L.hPut h bs
+        return sha
+    , packerComplete = do
+        hSeek h AbsoluteSeek 8
+        n <- readIORef counter
+        L.hPut h . runPut . putWord32be $ n
+        hSeek h AbsoluteSeek 0
+        content <- hReadAll h
+        let sha = bytestringDigest $ sha1 content
+        L.hPut h sha
+        hClose h
+    }
+
+-- | This is the function hGetContentsN from the bytestring package, minus the
+-- handle closing bit of code.
+hReadAll :: Handle -> IO L.ByteString
+hReadAll h = lazyRead -- TODO close on exceptions
+  where
+  lazyRead = unsafeInterleaveIO loop
+  loop = do
+    c <- B.hGetSome h I.defaultChunkSize -- only blocks if there is no data available
+    if B.null c
+      then return I.Empty
+      else do
+        cs <- lazyRead
+        return $ I.Chunk c cs
+
+pack :: Packer -> Object -> IO Ref
+pack packer = packerPack packer
+
+pack_ :: Packer -> Object -> IO ()
+pack_ packer o = packerPack packer o >> return ()
+
+completePack :: Packer -> IO ()
+completePack = packerComplete
+
+data Packer = Packer
+  { packerPack :: Object -> IO Ref
+  , packerComplete :: IO ()
+  }
 
 -- | Write a packfile. The content of the packfile is provided as a
 -- `Data.Binary.Put` serializer. The number of objects must be provided
 -- explicitely.
-writePack' :: FilePath -> Int -> Put -> IO ()
-writePack' fn n os = L.writeFile fn p
+writePack :: FilePath -> Int -> Put -> IO ()
+writePack fn n os = L.writeFile fn p
   -- TODO Compute the SHA1 sum on-the-fly.
   where p_ = runPut $ buildPack n os
         sha = bytestringDigest $ sha1 p_
