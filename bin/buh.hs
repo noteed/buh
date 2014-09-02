@@ -4,7 +4,7 @@ module Main (main) where
 
 import Codec.Compression.Zlib (compress)
 import Control.Applicative ((<$>))
-import Control.Monad (when)
+import Control.Monad (forM, when)
 import qualified Data.Attoparsec.ByteString.Char8 as A
 import Data.Attoparsec.ByteString.Lazy (parse, Result(..))
 import Data.Binary.Put
@@ -19,7 +19,7 @@ import qualified Data.ByteString.Lazy.Internal as I
 import Data.Digest.Pure.SHA (bytestringDigest, sha1)
 import Data.Int
 import Data.IORef
-import Data.List (sortBy)
+import Data.List (groupBy, nubBy, sortBy)
 import Data.Thyme.Clock (UTCTime)
 import Data.Thyme.Format (formatTime)
 import Data.Thyme.Time () -- For instance Num POSIXTime (a.k.a. NominalDiffTime)
@@ -85,32 +85,45 @@ main = do
       case splitDirectories path of
         rest -> enterMasterLatest cat rest
     ["pack"] -> do
-      packer <- newPack "objects/pack/p1.pack"
-      sha <- pack packer $ Blob 15 "Nice isn't it?\n"
-      sha' <- pack packer $ Tree [(normalFile, "README.md", sha)]
-      Ref sha'' <- pack packer $ Commit (Just sha') Nothing ""
-      completePack packer
-      (_, _, _, p) <- createProcess (proc "git"
-        [ "index-pack", "-v", "objects/pack/p1.pack"
-        ])
-      _ <- waitForProcess p
-      B.writeFile "refs/heads/master" $ sha'' `BC.append` "\n"
+      (sha, tree) <- repack "objects/pack/p1.pack"
+        [L "README.md" $ Blob 15 "Nice isn't it?\n"]
+        Nothing Nothing
+        "Initial commit."
+        "refs/heads/master"
 
-      hds <- readHeads Nothing
-      Sha sha <- lookupPath "master" hds
-      cs <- readRevs (Ref sha)
-      Ref sha' <- lookupPath "latest" cs
-      Commit (Just tree) _ _ <- readCommit $ Ref sha'
+      (sha2, tree2) <- repack "objects/pack/p2.pack"
+        [L "new.txt" $ Blob 6 "hello\n"]
+        (Just sha) (Just tree)
+        "Added new.txt."
+        "refs/heads/new-branch"
 
-      packer <- newPack "objects/pack/p2.pack"
-      sha <- rewrite packer [] (["new.txt"], Blob 6 "hello\n") tree
-      Ref sha'' <- pack packer $ Commit (Just sha) (Just $ Ref sha'') "Added new.txt."
-      completePack packer
-      (_, _, _, p) <- createProcess (proc "git"
-        [ "index-pack", "-v", "objects/pack/p2.pack"
-        ])
-      _ <- waitForProcess p
-      B.writeFile "refs/heads/new-branch" $ sha'' `BC.append` "\n"
+      (sha3, tree3) <- repack "objects/pack/p3.pack"
+        [T "a" [T "b" [L "c.txt" $ Blob 7 "Super.\n"]]]
+        (Just sha2) (Just tree2)
+        "Added a/b/c.txt."
+        "refs/heads/branch-3"
+
+      _ <- repack "objects/pack/p4.pack"
+        [L "new.txt" $ Blob 4 "bye\n"]
+        (Just sha3) (Just tree3)
+        "Changed hello to bye."
+        "refs/heads/branch-4"
+
+      let blob bs = Blob (L.length bs) bs
+      _ <- repack "objects/pack/p5.pack"
+        (groupBlobs
+          [ ("README.md", blob "Pack 5\n")
+          , ("bin/script.hs", blob "main = putStrLn \"Hello, world!\"\n")
+          , ("tests/data/set-1/file-00.txt", blob "10\n")
+          , ("tests/data/set-1/file-01.txt", blob "11\n")
+          , ("tests/data/EMPTY", blob "")
+          , ("tests/data/set-2/file-00.txt", blob "20\n")
+          , ("tests/data/set-1/file-02.txt", blob "12\n")
+          ])
+        Nothing Nothing
+        "Initial commit."
+        "refs/heads/branch-5"
+
       return ()
 
     xs -> error $ "TODO " ++ show xs
@@ -154,24 +167,101 @@ lookupPath k es = do
     Just v -> return v
     _ -> error $ "no file '" ++ BC.unpack k ++ "'" -- TODO exitFailure
 
--- TODO Handle only the most simple case.
-rewrite packer ps ([name], blob) ref = do
-  o <- readObject ref
-  case ps of
-    p':ps' -> case o of
-      Blob _ _ -> error $ "todo"
-      Tree es -> undefined
-      Commit _ _ _ -> error "todo"
-    [] -> case o of
-      Blob _ _ -> error $ "todo"
-      Tree es -> do
-        sha <- pack packer blob
-        let e = (normalFile, name, sha)
-        pack packer $ Tree $ e : remove name es
-      Commit _ _ _ -> error "Deref the tree ?"
+-- TODO Also make it possible to specify the mode of each entry.
+rewrite packer xs mref = do
+  o <- maybe (return $ Tree []) readObject mref
+  case o of
+    Blob _ _ -> error $ "file exists"
+    Tree es -> do
+      es' <- forM xs $ \x -> do
+        case x of
+          L name blob -> do
+            sha <- pack packer blob
+            return (normalFile, name, sha)
+          T name ys -> do
+            sha <- rewrite packer ys $ lookup name $ treeToRefs es
+            return (subdirectory, name, sha)
+      pack packer $ Tree . nubBy (\(_, a, _) (_, b, _) -> a == b) $ es' ++ es
+    Commit _ _ _ -> error "expected tree is a commit"
 
-remove p = filter ((/= p) . fst')
-  where fst' (a, _, _) = a
+data T p a = T p [T p a] | L p a
+  deriving Show
+
+input1 =
+  [ ([], "a", 1)
+  ]
+
+input2 =
+  [ ([], "a", 1)
+  , ([], "b", 2)
+  ]
+
+input3 =
+  [ ([], "a", 1)
+  , ([], "b", 2)
+  , (["e"], "c", 3)
+  ]
+
+input4 =
+  [ ([], "a", 1)
+  , ([], "b", 2)
+  , (["e"], "c", 3)
+  , (["f"], "d", 4)
+  ]
+
+input5 =
+  [ ([], "a", 1)
+  , ([], "b", 2)
+  , (["e"], "c", 3)
+  , (["f", "g"], "d", 4)
+  , (["f"], "i", 6)
+  , ([], "h", 5)
+  ]
+
+listBlobs = map listBlob . reverse . nubBy f . reverse
+  where f (a, _) (b, _) = a == b
+
+listBlob (path, blob) = case splitDirectories $ BC.unpack path of
+  [] -> error "at least a filename must be given"
+  xs -> (map BC.pack $ init xs, BC.pack $ last xs, blob)
+
+-- | Group blobs into a tree.
+groupBlobs = groupBlobs' . listBlobs
+
+groupBlobs' blobs = map (\(_, a, b) -> L a b) direct ++ rest
+  where
+  rest = map (\(d, bs) -> T d $ groupBlobs' bs) $ map pops $ groupBy f indirect
+  pops es@((x:_, _, _):_) = (x, map pop es)
+  pops [] = error "can't happen" -- groupBy returns non-empty lists
+  pop (_:xs, b, c) = (xs, b, c)
+  pop _ = error "can't happen" -- pop is called only on the indirect elements
+  (direct, indirect) = span isDirect $ sortBlobs blobs
+  isDirect ([], _, _) = True
+  isDirect _ = False
+  f ([], _, _) ([], _, _) = True -- unused, f is called on the indirect elements
+  f (x:_, _, _) (y:_, _, _) = x == y
+
+-- | This is used to group blobs by path, only to arrange them in trees within
+-- `groupBlobs`. The order is not the same as Git's Tree object. I.e. objects
+-- will be written in the packfile in a slightly different order than they are
+-- referenced in the Tree object.
+sortBlobs :: Ord p => [([p], p, a)] -> [([p], p, a)]
+sortBlobs = sortBy f
+  where
+  f (ps1, n1, _) (ps2, n2, _) = case compare ps1 ps2 of
+    EQ -> compare n1 n2
+    x -> x
+
+-- | `repack fn` creates a new packfile stored at `fn` containg a tree of blobs
+-- shadowing an optional tree. The resulting is referenced by commit, which
+-- can receive an optional parent.
+repack fn blobs msha mtree msg branch = do
+  packer <- newPack fn
+  tree' <- rewrite packer blobs mtree
+  Ref sha' <- pack packer $ Commit (Just tree') msha msg
+  completePack packer
+  B.writeFile branch $ sha' `BC.append` "\n" -- TODO Use git-update-ref.
+  return (Ref sha', tree')
 
 ----------------------------------------------------------------------
 -- Read git objects and refs
@@ -381,7 +471,8 @@ readRevs ref = do
 --
 ----------------------------------------------------------------------
 
--- | Incrementally build a pack.
+-- | Incrementally build a pack. It also builds the index. TODO Build the index
+-- as the packfile is built, not afterwards.
 newPack :: FilePath -> IO Packer
 newPack fn = do
   h <- openFile fn ReadWriteMode
@@ -405,7 +496,15 @@ newPack fn = do
         let sha = bytestringDigest $ sha1 content
         L.hPut h sha
         hClose h
+        indexPack fn
     }
+
+indexPack :: String -> IO ()
+indexPack path = do
+  (_, _, _, p) <- createProcess (proc "git"
+    ["index-pack", "-v", path])
+  _ <- waitForProcess p
+  return ()
 
 -- | This is the function hGetContentsN from the bytestring package, minus the
 -- handle closing bit of code.

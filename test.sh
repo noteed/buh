@@ -9,6 +9,8 @@ $HOME/projects/buh/dist/build/buh/buh pack
 
 git verify-pack -v objects/pack/p1.pack
 git verify-pack -v objects/pack/p2.pack
+git verify-pack -v objects/pack/p3.pack
+git verify-pack -v objects/pack/p4.pack
 
 git cat-file --batch-check << EOF
 51c9ddc4a58cca9a62002120d25480201e7b8cc8
@@ -16,8 +18,9 @@ git cat-file --batch-check << EOF
 e6b9d54befa4e9c72ce8463c54b1e78737df3eba
 EOF
 
-git log
-git log -p new-branch
+git log -p branch-4
+echo "-------------------"
+git log -p branch-5
 
 mkdir work
 GIT_WORK_TREE=work git checkout master
