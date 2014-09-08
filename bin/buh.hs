@@ -126,6 +126,8 @@ main = do
 
       return ()
 
+    ["fast-export"] -> fastExport exampleFiles
+
     xs -> error $ "TODO " ++ show xs
 
 enterMasterLatest :: (String -> Object -> IO a) -> [String] -> IO a
@@ -648,3 +650,44 @@ normalFile = "100644"
 
 subdirectory :: ByteString
 subdirectory = "040000"
+
+----------------------------------------------------------------------
+-- serialization to `git fast-import` format
+--
+-- Example usage:
+-- buh fast-export | git fast-import --date-format=no
+----------------------------------------------------------------------
+
+fastExport = L.putStr . toFastExport
+
+toFastExport = runPut . feCommit
+
+feCommit files = do
+  putByteString "commit refs/heads/fast-import\n"
+  -- mark?
+  -- author?
+  putByteString "committer Vo Minh Thu <noteed@gmail.com> now\n" -- TODO git date format
+  putByteString "data 0\n"
+  mapM_ fileModify files
+
+fileModify (path, Blob n bs) = do
+  putByteString "M "
+  putByteString normalFile
+  putByteString " inline "
+  putByteString path
+  putByteString "\ndata "
+  putByteString . BC.pack $ show n
+  putByteString "\n"
+  putLazyByteString bs
+  putByteString "\n"
+
+exampleFiles =
+  [ ("README.md", blob "Pack 5\n")
+  , ("bin/script.hs", blob "main = putStrLn \"Hello, world!\"\n")
+  , ("tests/data/set-1/file-00.txt", blob "10\n")
+  , ("tests/data/set-1/file-01.txt", blob "11\n")
+  , ("tests/data/EMPTY", blob "")
+  , ("tests/data/set-2/file-00.txt", blob "20\n")
+  , ("tests/data/set-1/file-02.txt", blob "12\n")
+  ]
+  where blob bs = Blob (L.length bs) bs
