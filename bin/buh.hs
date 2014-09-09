@@ -25,7 +25,7 @@ import Data.Thyme.Format (formatTime)
 import Data.Thyme.Time () -- For instance Num POSIXTime (a.k.a. NominalDiffTime)
 import Data.Thyme.Time.Core (posixSecondsToUTCTime)
 import Data.Word
-import System.Directory (doesDirectoryExist)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist)
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..))
 import System.FilePath (splitDirectories)
@@ -52,12 +52,14 @@ main = do
       e <- doesDirectoryExist path
       if e
         then error $ "directory " ++ path ++ " already exist"
+        else initRepository path
+    ["ensure", path] -> do
+      e <- doesDirectoryExist path
+      if e
+        then return ()
         else do
-          (_, _, _, p) <- createProcess (proc "git"
-            [ "init", "--bare", path
-            ])
-          _ <- waitForProcess p
-          return ()
+          createDirectoryIfMissing True path
+          initRepository path
     ["test"] -> do
       readRefs Nothing >>= print
       readHeads Nothing >>= print
@@ -127,8 +129,21 @@ main = do
       return ()
 
     ["fast-export"] -> fastExport exampleFiles
+    ["fast-import", path] -> do
+      (_, _, _, p) <- createProcess (proc "git"
+        [ "fast-import", "--date-format=now"
+        ]) { env = Just [("GIT_DIR", path)] }
+      _ <- waitForProcess p
+      return ()
 
     xs -> error $ "TODO " ++ show xs
+
+initRepository path = do
+  (_, _, _, p) <- createProcess (proc "git"
+    [ "init", "--bare", path
+    ])
+  _ <- waitForProcess p
+  return ()
 
 enterMasterLatest :: (String -> Object -> IO a) -> [String] -> IO a
 enterMasterLatest f path = do
@@ -655,7 +670,7 @@ subdirectory = "040000"
 -- serialization to `git fast-import` format
 --
 -- Example usage:
--- buh fast-export | git fast-import --date-format=no
+-- buh fast-export | git fast-import --date-format=now
 ----------------------------------------------------------------------
 
 fastExport = L.putStr . toFastExport
