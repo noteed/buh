@@ -4,6 +4,9 @@ module Main (main) where
 
 import Codec.Compression.Zlib (compress)
 import Control.Applicative ((<$>))
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar
+import qualified Control.Exception as C
 import Control.Monad (forM, when)
 import qualified Data.Attoparsec.ByteString.Char8 as A
 import Data.Attoparsec.ByteString.Lazy (parse, Result(..))
@@ -25,13 +28,13 @@ import Data.Thyme.Format (formatTime)
 import Data.Thyme.Time () -- For instance Num POSIXTime (a.k.a. NominalDiffTime)
 import Data.Thyme.Time.Core (posixSecondsToUTCTime)
 import Data.Word
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist)
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..))
-import System.FilePath (splitDirectories)
+import System.FilePath (splitDirectories, (</>))
 import System.IO
-  ( hClose, hFlush, hSeek, hSetFileSize, openFile, Handle, IOMode(..)
-  , SeekMode(AbsoluteSeek)
+  ( hClose, hFlush, hGetContents, hPutStr, hSeek, hSetFileSize, openFile
+  , Handle, IOMode(..), SeekMode(AbsoluteSeek)
   )
 import System.IO.Unsafe (unsafeInterleaveIO)
 import System.Locale (defaultTimeLocale)
@@ -48,71 +51,80 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
-    ["init", path] -> do
-      e <- doesDirectoryExist path
+    ["init", gitDir_] -> do
+      gitDir <- canonicalizePath gitDir_
+      e <- doesDirectoryExist gitDir
       if e
-        then error $ "directory " ++ path ++ " already exist"
-        else initRepository path
-    ["ensure", path] -> do
-      e <- doesDirectoryExist path
+        then error $ "directory " ++ gitDir ++ " already exist"
+        else initRepository gitDir
+    ["ensure", gitDir_] -> do
+      gitDir <- canonicalizePath gitDir_
+      e <- doesDirectoryExist gitDir
       if e
         then return ()
         else do
-          createDirectoryIfMissing True path
-          initRepository path
+          createDirectoryIfMissing True gitDir
+          initRepository gitDir
     ["test"] -> do
-      readRefs Nothing >>= print
-      readHeads Nothing >>= print
-      readObjects
+      gitDir <- canonicalizePath ".git"
+      readRefs gitDir Nothing >>= print
+      readHeads gitDir Nothing >>= print
+      readObjects gitDir
         [ Ref "32ab47487f560b11fdc758eedd9b43ee7aeb8684" -- blob
         , Ref "740fc0e4923e9f1ee5e0488cb1e7877c990a3f69" -- tree
         , Ref "a5b6d23259c76b66c933ba9940f6afcdf1bf3fff" -- commit
         ] >>= print
-      revList (Ref "a5b6d23259c76b66c933ba9940f6afcdf1bf3fff") >>= print
-      readRevs (Ref "a5b6d23259c76b66c933ba9940f6afcdf1bf3fff") >>= print
-    ["ls"] -> enterMasterLatest ls []
-    ["ls", "/"] -> do
+      revList gitDir (Ref "a5b6d23259c76b66c933ba9940f6afcdf1bf3fff") >>= print
+      readRevs gitDir (Ref "a5b6d23259c76b66c933ba9940f6afcdf1bf3fff") >>= print
+    ["ls", gitDir_] -> do
+      gitDir <- canonicalizePath gitDir_
+      checkRepository gitDir
+      enterMasterLatest gitDir ls []
+    ["ls", gitDir_, "/"] -> do
+      gitDir <- canonicalizePath gitDir_
       putStrLn "blob" -- access logical blobs, not chunks
       putStrLn "branch"
       putStrLn "chunk" -- access all blobs
       putStrLn "commit"
       putStrLn "time" -- same as commit but using the bup format YY-MM-DD-hhmmss instead of a hash
-    ["ls", path] -> do
+    ["ls", gitDir_, path] -> do
+      gitDir <- canonicalizePath gitDir_
       case splitDirectories path of
         ["/", "branch"] -> do
-          hds <- readHeads Nothing
+          hds <- readHeads gitDir Nothing
           mapM_ (BC.putStrLn . fst) hds
-        rest -> enterMasterLatest ls rest
+        rest -> enterMasterLatest gitDir ls rest
     ["cat", path] -> do
       case splitDirectories path of
-        rest -> enterMasterLatest cat rest
-    ["pack"] -> do
-      (sha, tree) <- repack "objects/pack/p1.pack"
+        rest -> enterMasterLatest ".git" cat rest
+    ["pack", gitDir_] -> do
+      gitDir <- canonicalizePath gitDir_
+      (sha, tree) <- repack gitDir "objects/pack/p1.pack"
         [L "README.md" $ Blob 15 "Nice isn't it?\n"]
         Nothing Nothing
         "Initial commit."
         "refs/heads/master"
 
-      (sha2, tree2) <- repack "objects/pack/p2.pack"
+      (sha2, tree2) <- repack gitDir "objects/pack/p2.pack"
         [L "new.txt" $ Blob 6 "hello\n"]
         (Just sha) (Just tree)
         "Added new.txt."
         "refs/heads/new-branch"
 
-      (sha3, tree3) <- repack "objects/pack/p3.pack"
+      (sha3, tree3) <- repack gitDir "objects/pack/p3.pack"
         [T "a" [T "b" [L "c.txt" $ Blob 7 "Super.\n"]]]
         (Just sha2) (Just tree2)
         "Added a/b/c.txt."
         "refs/heads/branch-3"
 
-      _ <- repack "objects/pack/p4.pack"
+      _ <- repack gitDir "objects/pack/p4.pack"
         [L "new.txt" $ Blob 4 "bye\n"]
         (Just sha3) (Just tree3)
         "Changed hello to bye."
         "refs/heads/branch-4"
 
       let blob bs = Blob (L.length bs) bs
-      _ <- repack "objects/pack/p5.pack"
+      _ <- repack gitDir "objects/pack/p5.pack"
         (groupBlobs
           [ ("README.md", blob "Pack 5\n")
           , ("bin/script.hs", blob "main = putStrLn \"Hello, world!\"\n")
@@ -129,10 +141,11 @@ main = do
       return ()
 
     ["fast-export"] -> fastExport exampleFiles
-    ["fast-import", path] -> do
+    ["fast-import", gitDir_] -> do
+      gitDir <- canonicalizePath gitDir_
       (_, _, _, p) <- createProcess (proc "git"
         [ "fast-import", "--date-format=now"
-        ]) { env = Just [("GIT_DIR", path)] }
+        ]) { env = Just [("GIT_DIR", gitDir)] }
       _ <- waitForProcess p
       return ()
 
@@ -145,14 +158,23 @@ initRepository path = do
   _ <- waitForProcess p
   return ()
 
-enterMasterLatest :: (String -> Object -> IO a) -> [String] -> IO a
-enterMasterLatest f path = do
-  hds <- readHeads Nothing
+-- | TODO Make the check more comprehensive.
+checkRepository path = do
+  e <- doesDirectoryExist path
+  e' <- doesDirectoryExist $ path </> "objects"
+  e'' <- doesDirectoryExist $ path </> "refs"
+  if e && e' && e''
+    then return ()
+    else error "Not a Git repository."
+
+enterMasterLatest :: FilePath -> (String -> Object -> IO a) -> [String] -> IO a
+enterMasterLatest gitDir f path = do
+  hds <- readHeads gitDir Nothing
   Sha sha <- lookupPath "master" hds
-  cs <- readRevs (Ref sha)
+  cs <- readRevs gitDir (Ref sha)
   Ref sha' <- lookupPath "latest" cs
-  Commit (Just tree) _ _ <- readCommit $ Ref sha'
-  enter f "latest" path tree
+  Commit (Just tree) _ _ <- readCommit gitDir $ Ref sha'
+  enter gitDir f "latest" path tree
 
 ls :: String -> Object -> IO ()
 ls p o = case o of
@@ -166,15 +188,15 @@ cat _ o = case o of
   Tree _ -> error "is a directory"
   Blob _ bs -> L.putStr bs
 
-enter :: (String -> Object -> IO a) -> String -> [String] -> Ref -> IO a
-enter f p ps ref = do
-  o <- readObject ref
+enter :: FilePath -> (String -> Object -> IO a) -> String -> [String] -> Ref -> IO a
+enter gitDir f p ps ref = do
+  o <- readObject gitDir ref
   case ps of
     p':ps' -> case o of
       Blob _ _ -> error $ "no file '" ++ p' ++ "'"
       Tree es -> do
         ref' <- lookupPath (BC.pack p') $ treeToRefs es
-        enter f p' ps' ref'
+        enter gitDir f p' ps' ref'
       Commit _ _ _ -> error "Deref the tree ?"
     [] -> f p o
 
@@ -185,8 +207,8 @@ lookupPath k es = do
     _ -> error $ "no file '" ++ BC.unpack k ++ "'" -- TODO exitFailure
 
 -- TODO Also make it possible to specify the mode of each entry.
-rewrite packer xs mref = do
-  o <- maybe (return $ Tree []) readObject mref
+rewrite gitDir packer xs mref = do
+  o <- maybe (return $ Tree []) (readObject gitDir) mref
   case o of
     Blob _ _ -> error $ "file exists"
     Tree es -> do
@@ -196,7 +218,7 @@ rewrite packer xs mref = do
             sha <- pack packer blob
             return (normalFile, name, sha)
           T name ys -> do
-            sha <- rewrite packer ys $ lookup name $ treeToRefs es
+            sha <- rewrite gitDir packer ys $ lookup name $ treeToRefs es
             return (subdirectory, name, sha)
       pack packer $ Tree . nubBy (\(_, a, _) (_, b, _) -> a == b) $ es' ++ es
     Commit _ _ _ -> error "expected tree is a commit"
@@ -269,12 +291,12 @@ sortBlobs = sortBy f
     EQ -> compare n1 n2
     x -> x
 
--- | `repack fn` creates a new packfile stored at `fn` containg a tree of blobs
+-- | `repack _ fn` creates a new packfile stored at `fn` containg a tree of blobs
 -- shadowing an optional tree. The resulting is referenced by commit, which
 -- can receive an optional parent.
-repack fn blobs msha mtree msg branch = do
+repack gitDir fn blobs msha mtree msg branch = do
   packer <- newPack fn
-  tree' <- rewrite packer blobs mtree
+  tree' <- rewrite gitDir packer blobs mtree
   Ref sha' <- pack packer $ Commit (Just tree') msha msg
   completePack packer
   B.writeFile branch $ sha' `BC.append` "\n" -- TODO Use git-update-ref.
@@ -301,33 +323,40 @@ data Object =
   deriving Show
 
 -- | `git show-ref`
-readRefs :: Maybe Ref -> IO [(Ref, Sha)]
-readRefs mref = do
-  (code, out, _) <- readProcessWithExitCode "git"
+readRefs :: FilePath -> Maybe Ref -> IO [(Ref, Sha)]
+readRefs gitDir mref = do
+  (code, out, _) <- readProcessWithExitCode' "git"
     ([ "show-ref", "--" ] ++ maybe [] s mref)
+    [("GIT_DIR", gitDir)]
     ""
   if code == ExitSuccess
     then return . map (p . words) $ lines out
-    else error "git failed"
+    -- git show-ref returns a exit code 1 when there is no ref.
+    -- TODO Differentiate between no ref and other non-zero exit codes.
+    else return []
 
   where s (Ref r) =[ BC.unpack r]
         p [sha, r] = (Ref $ BC.pack r, Sha $ BC.pack sha)
         p _ = error "unexpected git-show-ref output"
 
 -- | Like readRefs, but return only those matching `refs/heads`.
-readHeads :: Maybe Ref -> IO [(ByteString, Sha)]
-readHeads mref = do
-  refs <- readRefs mref
+readHeads :: FilePath -> Maybe Ref -> IO [(ByteString, Sha)]
+readHeads gitDir mref = do
+  refs <- readRefs gitDir mref
   return $ map unref $ filter (prefix . fst) refs
   where unref (Ref r, sha) = (BC.drop 11 r, sha)
         prefix (Ref r) = BC.isPrefixOf "refs/heads/" r
 
 -- | `git cat-file --batch`
-readObjects :: [Ref] -> IO [Object]
-readObjects refs = do
+readObjects :: FilePath -> [Ref] -> IO [Object]
+readObjects gitDir refs = do
   (Just pIn, Just pOut, _, p) <- createProcess (proc "git"
     [ "cat-file", "--batch"
-    ]) { std_in = CreatePipe, std_out = CreatePipe }
+    ])
+    { std_in = CreatePipe
+    , std_out = CreatePipe
+    , env = Just [("GIT_DIR", gitDir)]
+    }
   let putRef (Ref r) = do
         BC.hPutStrLn pIn r
         hFlush pIn
@@ -357,7 +386,7 @@ readObjects refs = do
                 loop [] o
               "commit" -> return $ parseCommit o
               _ -> error "unexpected git-cat-file output (2)"
-          _ -> error "unexpected git-cat-file output (3)"
+          x -> error $ "unexpected git-cat-file output (3)" ++ show x
   os <- mapM (\r -> putRef r >> readOne) refs
   hClose pIn
   _ <- waitForProcess p
@@ -367,36 +396,36 @@ toStrict :: L.ByteString -> ByteString
 toStrict = B.concat . L.toChunks
 
 -- | Similar to `readObjects` with a single ref.
-readObject :: Ref -> IO Object
-readObject ref = do
-  os <- readObjects [ref]
+readObject :: FilePath -> Ref -> IO Object
+readObject gitDir ref = do
+  os <- readObjects gitDir [ref]
   case os of
     [o] -> return o
     _ -> error $ "can't happen"
 
 -- | Similar to `readObjects` (with a single ref), and error out if the result
 -- is not a blob.
-readBlob :: Ref -> IO Object
-readBlob ref = do
-  o <- readObject ref
+readBlob :: FilePath -> Ref -> IO Object
+readBlob gitDir ref = do
+  o <- readObject gitDir ref
   case o of
     Blob _ _ -> return o
     _ -> error $ "expected blob object"
 
 -- | Similar to `readObjects` (with a single ref), and error out if the result
 -- is not a commit.
-readCommit :: Ref -> IO Object
-readCommit ref = do
-  o <- readObject ref
+readCommit :: FilePath -> Ref -> IO Object
+readCommit gitDir ref = do
+  o <- readObject gitDir ref
   case o of
     Commit _ _ _ -> return o
     _ -> error $ "expected commit object"
 
 -- | Similar to `readObjects` (with a single ref), and error out if the result
 -- is not a tree.
-readTree :: Ref -> IO Object
-readTree ref = do
-  o <- readObject ref
+readTree :: FilePath -> Ref -> IO Object
+readTree gitDir ref = do
+  o <- readObject gitDir ref
   case o of
     Tree _ -> return o
     _ -> error $ "expected tree object"
@@ -421,10 +450,11 @@ parseCommit bs = case parse p bs of
             (c >= 'A' && c <= 'F')
 
 -- | `git rev-list --pretty=format:%at`
-revList :: Ref -> IO [(Ref, UTCTime)]
-revList ref = do
-  (code, out, _) <- readProcessWithExitCode "git"
+revList :: FilePath -> Ref -> IO [(Ref, UTCTime)]
+revList gitDir ref = do
+  (code, out, _) <- readProcessWithExitCode' "git"
     [ "rev-list", "--pretty=format:%at", BC.unpack $ unRef ref ]
+    [("GIT_DIR", gitDir)]
     ""
   if code == ExitSuccess
     then return . p [] $ lines out
@@ -437,13 +467,13 @@ revList ref = do
     p ((Ref . BC.pack $ drop 7 l1, posixSecondsToUTCTime . fromInteger $ read l2) : xs) rest
   p xs [l1] | "commit":_ <- words l1 =
     p ((Ref . BC.pack $ drop 7 l1, posixSecondsToUTCTime . fromInteger $ 0) : xs) []
-  p xs [] = xs
+  p xs [] = reverse xs
   p _ _ = error "unexpected line from git-rev-list"
 
 -- | Similar to `revList` but the result type matches `readHeads`.
-readRevs :: Ref -> IO [(ByteString, Ref)]
-readRevs ref = do
-  refs <- revList ref
+readRevs :: FilePath -> Ref -> IO [(ByteString, Ref)]
+readRevs gitDir ref = do
+  refs <- revList gitDir ref
   return . latest $ map f refs
   where
   f (r, t) = (BC.pack $ formatTime locale format t, r)
@@ -706,3 +736,44 @@ exampleFiles =
   , ("tests/data/set-1/file-02.txt", blob "12\n")
   ]
   where blob bs = Blob (L.length bs) bs
+
+-- | Same as System.Process.readProcessWithExitCode but allow to pass an
+-- environment.
+readProcessWithExitCode'
+    :: FilePath                 -- ^ command to run
+    -> [String]                 -- ^ any arguments
+    -> [(String, String)]       -- ^ environment
+    -> String                   -- ^ standard input
+    -> IO (ExitCode,String,String) -- ^ exitcode, stdout, stderr
+readProcessWithExitCode' cmd args env input = do
+  (Just inh, Just outh, Just errh, pid) <-
+    createProcess (proc cmd args)
+    { std_in  = CreatePipe
+    , std_out = CreatePipe
+    , std_err = CreatePipe
+    , env = Just env
+    }
+
+  outMVar <- newEmptyMVar
+
+  -- fork off a thread to start consuming stdout
+  out  <- hGetContents outh
+  forkIO $ C.evaluate (length out) >> putMVar outMVar ()
+
+  -- fork off a thread to start consuming stderr
+  err  <- hGetContents errh
+  forkIO $ C.evaluate (length err) >> putMVar outMVar ()
+
+  -- now write and flush any input
+  when (not (null input)) $ do hPutStr inh input; hFlush inh
+  hClose inh -- done with stdin
+
+  -- wait on the output
+  takeMVar outMVar
+  takeMVar outMVar
+  hClose outh
+
+  -- wait on the process
+  ex <- waitForProcess pid
+
+  return (ex, out, err)
