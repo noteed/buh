@@ -36,6 +36,7 @@ import System.IO
   ( hClose, hFlush, hGetContents, hPutStr, hSeek, hSetFileSize, openFile
   , Handle, IOMode(..), SeekMode(AbsoluteSeek)
   )
+import qualified System.IO.Streams as S
 import System.IO.Unsafe (unsafeInterleaveIO)
 import System.Locale (defaultTimeLocale)
 import System.Process
@@ -59,12 +60,7 @@ main = do
         else initRepository gitDir
     ["ensure", gitDir_] -> do
       gitDir <- canonicalizePath gitDir_
-      e <- doesDirectoryExist gitDir
-      if e
-        then return ()
-        else do
-          createDirectoryIfMissing True gitDir
-          initRepository gitDir
+      ensureGitDir gitDir
     ["test"] -> do
       gitDir <- canonicalizePath ".git"
       readRefs gitDir Nothing >>= print
@@ -140,14 +136,15 @@ main = do
 
       return ()
 
-    ["fast-export"] -> fastExport exampleFiles
+    ["fast-export"] -> fastExport Nothing exampleFiles
     ["fast-import", gitDir_] -> do
+      ensureGitDir gitDir_
       gitDir <- canonicalizePath gitDir_
-      (_, _, _, p) <- createProcess (proc "git"
-        [ "fast-import", "--date-format=now"
-        ]) { env = Just [("GIT_DIR", gitDir)] }
-      _ <- waitForProcess p
-      return ()
+      gitFastImport gitDir False
+    ["fast-import", "--files", gitDir_] -> do
+      ensureGitDir gitDir_
+      gitDir <- canonicalizePath gitDir_
+      gitFastImport gitDir True
 
     xs -> error $ "TODO " ++ show xs
 
@@ -166,6 +163,37 @@ checkRepository path = do
   if e && e' && e''
     then return ()
     else error "Not a Git repository."
+
+ensureGitDir gitDir = do
+  e <- doesDirectoryExist gitDir
+  if e
+    then return ()
+    else do
+      createDirectoryIfMissing True gitDir
+      initRepository gitDir
+
+-- | If doCommit is True, the commit command is automatically sent before the
+-- rest of the input stream.
+gitFastImport gitDir doCommit = do
+  is <- if doCommit
+        then do
+          -- If the ref already exists, then continue the commit from it.
+          refs <- readHeads gitDir $ Just $ Ref "refs/heads/fast-import"
+          commit <- if length refs == 1
+                    then S.fromLazyByteString . runPut $ feCommit (Just "refs/heads/fast-import")
+                    else S.fromLazyByteString . runPut $ feCommit Nothing
+          S.appendInputStream commit S.stdin
+        else return S.stdin
+  (Just hin, _, _, p) <- createProcess (proc "git"
+    [ "fast-import", "--date-format=now"
+    ]) { env = Just [("GIT_DIR", gitDir)]
+       , std_in = CreatePipe
+       }
+  sIn  <- S.handleToOutputStream hin >>=
+    S.atEndOfOutput (hClose hin)
+  S.connect is sIn
+  _ <- waitForProcess p
+  return ()
 
 enterMasterLatest :: FilePath -> (String -> Object -> IO a) -> [String] -> IO a
 enterMasterLatest gitDir f path = do
@@ -703,17 +731,19 @@ subdirectory = "040000"
 -- buh fast-export | git fast-import --date-format=now
 ----------------------------------------------------------------------
 
-fastExport = L.putStr . toFastExport
+fastExport mfrom files = L.putStr $ toFastExport mfrom files
 
-toFastExport = runPut . feCommit
+toFastExport mfrom files = runPut (feCommit mfrom >> feFiles files)
 
-feCommit files = do
+feCommit (mfrom) = do
   putByteString "commit refs/heads/fast-import\n"
   -- mark?
   -- author?
   putByteString "committer Vo Minh Thu <noteed@gmail.com> now\n" -- TODO git date format
   putByteString "data 0\n"
-  mapM_ fileModify files
+  maybe (return ()) (\ref -> putByteString $ B.concat ["from ", ref, "^0\n"]) mfrom
+
+feFiles = mapM_ fileModify
 
 fileModify (path, Blob n bs) = do
   putByteString "M "
