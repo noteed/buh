@@ -31,7 +31,7 @@ import Data.Word
 import System.Directory (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist)
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..))
-import System.FilePath (splitDirectories, (</>))
+import System.FilePath (joinPath, splitDirectories, (</>))
 import System.IO
   ( hClose, hFlush, hGetContents, hPutStr, hSeek, hSetFileSize, openFile
   , Handle, IOMode(..), SeekMode(AbsoluteSeek)
@@ -135,7 +135,16 @@ main = do
 
       return ()
 
-    ["fast-export"] -> fastExport Nothing exampleFiles
+    -- `buh fast-export` is meant to be used with `buh fast-import --files` i.e.
+    -- the commit command is not issued.
+    -- Example:
+    --    buh fast-export .git branch/develop/latest/static/css | buh fast-import --files barerepo
+    -- This will create a css directory at the root of the bare repo.
+    ["fast-export", gitDir_, path] -> do
+      gitDir <- canonicalizePath gitDir_
+      checkRepository gitDir
+      case splitDirectories path of
+        "branch" : branch : commit : rest -> enterBranchCommit gitDir export branch commit rest
     ["fast-import", gitDir_] -> do
       ensureGitDir gitDir_
       gitDir <- canonicalizePath gitDir_
@@ -201,28 +210,44 @@ enterBranch gitDir branch = do
   cs <- readRevs gitDir (Ref sha)
   mapM_ (BC.putStrLn . fst) cs
 
-enterBranchCommit :: FilePath -> (String -> Object -> IO a) -> String -> String -> [String] -> IO a
+enterBranchCommit :: FilePath -> (FilePath -> String -> Object -> IO a) -> String -> String -> [String] -> IO a
 enterBranchCommit gitDir f branch commit path = do
   hds <- readHeads gitDir Nothing
   Sha sha <- lookupPath (BC.pack branch) hds
   cs <- readRevs gitDir (Ref sha)
   Ref sha' <- lookupPath (BC.pack commit) cs
   Commit (Just tree) _ _ <- readCommit gitDir $ Ref sha'
-  enter gitDir f commit path tree
+  enter gitDir f "/" path tree
 
-ls :: String -> Object -> IO ()
-ls p o = case o of
+ls :: FilePath -> String -> Object -> IO ()
+ls _ p o = case o of
   Commit _ _ _ -> error "resolve to a commit"
   Tree es -> mapM_ (BC.putStrLn . fst) $ treeToRefs es
   Blob _ _ -> putStrLn p
 
-cat :: String -> Object -> IO ()
-cat _ o = case o of
+cat :: FilePath -> String -> Object -> IO ()
+cat _ _ o = case o of
   Commit _ _ _ -> error "resolve to a commit"
   Tree _ -> error "is a directory"
   Blob _ bs -> L.putStr bs
 
-enter :: FilePath -> (String -> Object -> IO a) -> String -> [String] -> Ref -> IO a
+export :: FilePath -> String -> Object -> IO ()
+export gitDir p o = export' gitDir p ps o
+  where ps = if p == "/" then [] else [p]
+
+export' :: FilePath -> String -> [String] -> Object -> IO ()
+export' gitDir p ps o = case o of
+  Commit _ _ _ -> error "resolve to a commit"
+  Tree es -> do
+    let refs = treeToRefs es
+        f (p', ref) = do
+          o <- readObject gitDir ref
+          export' gitDir (BC.unpack p') (BC.unpack p':ps) o
+    mapM_ f refs
+  -- Blob _ bs -> putStrLn . ("Exporting " ++) . joinPath $ reverse ps
+  Blob _ _ -> L.putStr . runPut $ fileModify (BC.pack . joinPath $ reverse ps, o)
+
+enter :: FilePath -> (FilePath -> String -> Object -> IO a) -> String -> [String] -> Ref -> IO a
 enter gitDir f p ps ref = do
   o <- readObject gitDir ref
   case ps of
@@ -232,7 +257,7 @@ enter gitDir f p ps ref = do
         ref' <- lookupPath (BC.pack p') $ treeToRefs es
         enter gitDir f p' ps' ref'
       Commit _ _ _ -> error "Deref the tree ?"
-    [] -> f p o
+    [] -> f gitDir p o
 
 lookupPath :: ByteString -> [(ByteString, a)] -> IO a
 lookupPath k es = do
@@ -382,6 +407,8 @@ readHeads gitDir mref = do
         prefix (Ref r) = BC.isPrefixOf "refs/heads/" r
 
 -- | `git cat-file --batch`
+-- TODO Keep the process `git cat-file` around and query it instead of
+-- respawning it again and again.
 readObjects :: FilePath -> [Ref] -> IO [Object]
 readObjects gitDir refs = do
   (Just pIn, Just pOut, _, p) <- createProcess (proc "git"
@@ -737,7 +764,7 @@ subdirectory = "040000"
 -- buh fast-export | git fast-import --date-format=now
 ----------------------------------------------------------------------
 
-fastExport mfrom files = L.putStr $ toFastExport mfrom files
+fastExport gitDir mfrom files = L.putStr $ toFastExport mfrom files
 
 toFastExport mfrom files = runPut (feCommit mfrom >> feFiles files)
 
@@ -761,17 +788,6 @@ fileModify (path, Blob n bs) = do
   putByteString "\n"
   putLazyByteString bs
   putByteString "\n"
-
-exampleFiles =
-  [ ("README.md", blob "Pack 5\n")
-  , ("bin/script.hs", blob "main = putStrLn \"Hello, world!\"\n")
-  , ("tests/data/set-1/file-00.txt", blob "10\n")
-  , ("tests/data/set-1/file-01.txt", blob "11\n")
-  , ("tests/data/EMPTY", blob "")
-  , ("tests/data/set-2/file-00.txt", blob "20\n")
-  , ("tests/data/set-1/file-02.txt", blob "12\n")
-  ]
-  where blob bs = Blob (L.length bs) bs
 
 -- | Same as System.Process.readProcessWithExitCode but allow to pass an
 -- environment.
