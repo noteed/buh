@@ -74,10 +74,6 @@ main = do
       readRevs gitDir (Ref "a5b6d23259c76b66c933ba9940f6afcdf1bf3fff") >>= print
     ["ls", gitDir_] -> do
       gitDir <- canonicalizePath gitDir_
-      checkRepository gitDir
-      enterMasterLatest gitDir ls []
-    ["ls", gitDir_, "/"] -> do
-      gitDir <- canonicalizePath gitDir_
       putStrLn "blob" -- access logical blobs, not chunks
       putStrLn "branch"
       putStrLn "chunk" -- access all blobs
@@ -86,13 +82,16 @@ main = do
     ["ls", gitDir_, path] -> do
       gitDir <- canonicalizePath gitDir_
       case splitDirectories path of
-        ["/", "branch"] -> do
+        ["branch"] -> do
           hds <- readHeads gitDir Nothing
           mapM_ (BC.putStrLn . fst) hds
-        rest -> enterMasterLatest gitDir ls rest
-    ["cat", path] -> do
+        ["branch", branch] -> do
+          enterBranch gitDir branch
+        "branch" : branch : commit : rest -> enterBranchCommit gitDir ls branch commit rest
+    ["cat", gitDir_, path] -> do
+      gitDir <- canonicalizePath gitDir_
       case splitDirectories path of
-        rest -> enterMasterLatest ".git" cat rest
+        "branch" : branch : commit : rest -> enterBranchCommit gitDir cat branch commit rest
     ["pack", gitDir_] -> do
       gitDir <- canonicalizePath gitDir_
       (sha, tree) <- repack gitDir "objects/pack/p1.pack"
@@ -195,14 +194,21 @@ gitFastImport gitDir doCommit = do
   _ <- waitForProcess p
   return ()
 
-enterMasterLatest :: FilePath -> (String -> Object -> IO a) -> [String] -> IO a
-enterMasterLatest gitDir f path = do
+enterBranch :: FilePath -> String -> IO ()
+enterBranch gitDir branch = do
   hds <- readHeads gitDir Nothing
-  Sha sha <- lookupPath "master" hds
+  Sha sha <- lookupPath (BC.pack branch) hds
   cs <- readRevs gitDir (Ref sha)
-  Ref sha' <- lookupPath "latest" cs
+  mapM_ (BC.putStrLn . fst) cs
+
+enterBranchCommit :: FilePath -> (String -> Object -> IO a) -> String -> String -> [String] -> IO a
+enterBranchCommit gitDir f branch commit path = do
+  hds <- readHeads gitDir Nothing
+  Sha sha <- lookupPath (BC.pack branch) hds
+  cs <- readRevs gitDir (Ref sha)
+  Ref sha' <- lookupPath (BC.pack commit) cs
   Commit (Just tree) _ _ <- readCommit gitDir $ Ref sha'
-  enter gitDir f "latest" path tree
+  enter gitDir f commit path tree
 
 ls :: String -> Object -> IO ()
 ls p o = case o of
