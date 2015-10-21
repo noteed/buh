@@ -34,3 +34,15 @@ executable buh
                        zlib
   ghc-options:         -Wall
                        -O2
+
+executable hush
+  hs-source-dirs:      bin
+  main-is:             hush.hs
+  build-depends:       base == 4.*,
+                       bytestring,
+                       directory,
+                       filepath,
+                       SHA,
+                       zlib
+  ghc-options:         -Wall
+                       -O2

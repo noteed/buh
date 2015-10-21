@@ -1,6 +1,8 @@
 all: .try_buh_touched
 
-./dist/build/buh/buh: bin/buh.hs
+dist/build/buh/buh dist/build/hush/hush: \
+  bin/buh.hs \
+  bin/hush.hs
 	docker run \
           -v `pwd`:/source -t -i \
           images.reesd.com/reesd/stack sh -c \
